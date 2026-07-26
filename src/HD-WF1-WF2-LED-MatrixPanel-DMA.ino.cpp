@@ -210,7 +210,7 @@ void setup() {
 
   dma_display = new MatrixPanel_I2S_DMA(mxconfig);
   dma_display->begin();
-  dma_display->setBrightness8(128); //0-255
+  dma_display->setBrightness8(64); //0-255 - lowered to cut current draw roughly in half
   dma_display->clearScreen();
 
   dma_display->fillScreenRGB888(255,0,0);
