@@ -1,6 +1,9 @@
 // Minimal LED Matrix Firmware for the Huidu HUB75 Series Control Cards.
 // No WiFi, no RTC/NTP, no web server. Just: boot -> play audio-reactive GIF forever.
 
+
+
+
 #if defined(WF1)
   #include "hd-wf1-esp32s2-config.h"
 #elif defined(WF2)
@@ -191,7 +194,10 @@ void updateAudioReactiveGif() {
 
 void setup() {
   Serial.begin(115200);
-
+for (int i = 5; i > 0; i--) {
+    Serial.printf("Starting in %d...\n", i);
+    delay(1000);
+}
   /*-------------------- START THE HUB75E DISPLAY --------------------*/
   HUB75_I2S_CFG mxconfig(
     PANEL_RES_X,
