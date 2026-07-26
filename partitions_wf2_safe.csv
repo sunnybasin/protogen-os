@@ -1,0 +1,10 @@
+# Name,     Type, SubType,  Offset,   Size
+# Custom table for boards where only ~4.5MB of the 8MB flash is reliably
+# usable. No OTA slots (not needed - this firmware doesn't use WiFi OTA),
+# just one factory app partition plus a LittleFS data partition, both
+# comfortably inside the safe ~4.5MB window.
+
+nvs,        data, nvs,      0x9000,   0x5000
+phy_init,   data, phy,      0xf000,   0x1000
+factory,    app,  factory,  0x10000,  0x180000
+spiffs,     data, spiffs,   0x190000, 0x200000
