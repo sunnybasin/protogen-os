@@ -12,12 +12,18 @@
 #endif
 
 #include "debug.h"
-#include "littlefs_core.h"
 
 #include <Arduino.h>
 #include <ESP32-HUB75-MatrixPanel-I2S-DMA.h>
 #include <AnimatedGIF.h>
 #include "esp_partition.h"
+
+// Generate these two files with bin2h.py (see project notes), then place
+// them in src/ alongside this file:
+//   python bin2h.py silence.gif silence_gif silence_gif.h
+//   python bin2h.py talking.gif talking_gif talking_gif.h
+#include "silence_gif.h"
+#include "talking_gif.h"
 
 void dumpPartitionTable() {
   Serial.println("---- Partition table on this chip ----");
@@ -31,8 +37,6 @@ void dumpPartitionTable() {
   esp_partition_iterator_release(it);
   Serial.println("---------------------------------------");
 }
-
-#define fs LittleFS
 
 /*-------------------------- HUB75E DMA Setup -----------------------------*/
 #define PANEL_RES_X 64      // Number of pixels wide of each INDIVIDUAL panel module.
@@ -54,15 +58,11 @@ HUB75_I2S_CFG::i2s_pins _pins_x1 = {WF2_X1_R1_PIN, WF2_X1_G1_PIN, WF2_X1_B1_PIN,
 #define AUDIOGIF_MARGIN_OFF       25
 #define AUDIOGIF_STATE_DWELL_MS   400
 #define AUDIOGIF_EMA_ALPHA        0.35f
-static const char *AUDIOGIF_SILENCE_PATH = "/silence.gif";
-static const char *AUDIOGIF_TALKING_PATH = "/talking.gif";
 
 MatrixPanel_I2S_DMA *dma_display = nullptr;
 
 AnimatedGIF gif;
-File gifFile;
 bool gifOpenOk = false;
-bool littleFsMounted = false;
 int audioNoiseFloor = 0;
 float audioSmoothedLevel = 0;
 bool audioIsTalking = false;
@@ -71,39 +71,8 @@ unsigned long audioCandidateSince = 0;
 unsigned long lastStatusPrint = 0;
 
 // ------------------------------------------------------------------
-// LittleFS <-> AnimatedGIF file callbacks
+// GIF draw callback - called once per decoded scanline
 // ------------------------------------------------------------------
-void *AudioGifOpenFile(const char *fname, int32_t *pFileSize) {
-  gifFile = fs.open(fname, "r");
-  if (!gifFile) {
-    *pFileSize = 0;
-    return nullptr;
-  }
-  *pFileSize = gifFile.size();
-  return (void *)&gifFile;
-}
-
-void AudioGifCloseFile(void *pHandle) {
-  File *f = static_cast<File *>(pHandle);
-  if (f) f->close();
-}
-
-int32_t AudioGifReadFile(GIFFILE *pFile, uint8_t *pBuf, int32_t iLen) {
-  File *f = static_cast<File *>(pFile->fHandle);
-  if (!f) return 0;
-  int32_t iBytesRead = f->read(pBuf, iLen);
-  pFile->iPos += iBytesRead;
-  return iBytesRead;
-}
-
-int32_t AudioGifSeekFile(GIFFILE *pFile, int32_t iPosition) {
-  File *f = static_cast<File *>(pFile->fHandle);
-  if (!f) return 0;
-  f->seek(iPosition);
-  pFile->iPos = iPosition;
-  return iPosition;
-}
-
 void AudioGifDraw(GIFDRAW *pDraw) {
   uint8_t *s = pDraw->pPixels;
   uint16_t *usPalette = pDraw->pPalette;
@@ -164,12 +133,15 @@ void audioGifCalibrateNoiseFloor() {
 
 void audioGifOpenForState(bool talking) {
   gif.close();
-  const char *path = talking ? AUDIOGIF_TALKING_PATH : AUDIOGIF_SILENCE_PATH;
-  gifOpenOk = gif.open(path, AudioGifOpenFile, AudioGifCloseFile, AudioGifReadFile, AudioGifSeekFile, AudioGifDraw);
-  if (!gifOpenOk) {
-    Serial.printf("Failed to open %s\n", path);
+  if (talking) {
+    gifOpenOk = gif.open((uint8_t *)talking_gif, talking_gif_len, AudioGifDraw);
   } else {
-    Serial.printf("Playing %s\n", path);
+    gifOpenOk = gif.open((uint8_t *)silence_gif, silence_gif_len, AudioGifDraw);
+  }
+  if (!gifOpenOk) {
+    Serial.printf("Failed to open %s gif\n", talking ? "talking" : "silence");
+  } else {
+    Serial.printf("Playing %s gif\n", talking ? "talking" : "silence");
   }
 }
 
@@ -207,8 +179,7 @@ void updateAudioReactiveGif() {
     // no need to catch the exact moment of boot.
     if (millis() - lastStatusPrint > 1000) {
       lastStatusPrint = millis();
-      Serial.printf("[STATUS] LittleFS mounted: %s | gifOpenOk: %s | state: %s\n",
-                    littleFsMounted ? "yes" : "no",
+      Serial.printf("[STATUS] gifOpenOk: %s | state: %s\n",
                     gifOpenOk ? "yes" : "no",
                     audioIsTalking ? "talking" : "silence");
     }
@@ -249,15 +220,6 @@ void setup() {
   dma_display->fillScreenRGB888(0,0,255);
   delay(500);
   dma_display->clearScreen();
-
-  /*-------------------- INIT LITTLE FS --------------------*/
-  littleFsMounted = LittleFS.begin(FORMAT_LITTLEFS_IF_FAILED);
-  if (!littleFsMounted) {
-      Serial.println("*** LittleFS Mount FAILED ***");
-  } else {
-      Serial.println("*** LittleFS Mount OK ***");
-      listDir(LittleFS, "/", 1);
-  }
 
   /*-------------------- Audio-reactive GIF init --------------------*/
   analogReadResolution(12);       // 0-4095
