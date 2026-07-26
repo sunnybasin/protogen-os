@@ -1,8 +1,7 @@
-// Minimal LED Matrix Firmware for the Huidu HUB75 Series Control Cards.
-// No WiFi, no RTC/NTP, no web server. Just: boot -> play audio-reactive GIF forever.
-
-
-
+// Minimal LED Matrix Firmware for the Huidu WF2 (ESP32-S3) HUB75 Control Card.
+// No WiFi, no RTC/NTP, no web server, no button. Just: boot -> play
+// audio-reactive GIF forever, switching between silence.gif and talking.gif
+// based on a MAX4466 mic on GPIO1.
 
 #if defined(WF1)
   #include "hd-wf1-esp32s2-config.h"
@@ -18,6 +17,20 @@
 #include <Arduino.h>
 #include <ESP32-HUB75-MatrixPanel-I2S-DMA.h>
 #include <AnimatedGIF.h>
+#include "esp_partition.h"
+
+void dumpPartitionTable() {
+  Serial.println("---- Partition table on this chip ----");
+  esp_partition_iterator_t it = esp_partition_find(ESP_PARTITION_TYPE_ANY, ESP_PARTITION_SUBTYPE_ANY, NULL);
+  while (it != NULL) {
+    const esp_partition_t *p = esp_partition_get(it);
+    Serial.printf("  %-10s type=%d subtype=%d offset=0x%06x size=0x%06x (%u KB)\n",
+                  p->label, p->type, p->subtype, p->address, p->size, p->size / 1024);
+    it = esp_partition_next(it);
+  }
+  esp_partition_iterator_release(it);
+  Serial.println("---------------------------------------");
+}
 
 #define fs LittleFS
 
@@ -49,11 +62,13 @@ MatrixPanel_I2S_DMA *dma_display = nullptr;
 AnimatedGIF gif;
 File gifFile;
 bool gifOpenOk = false;
+bool littleFsMounted = false;
 int audioNoiseFloor = 0;
 float audioSmoothedLevel = 0;
 bool audioIsTalking = false;
 bool audioCandidateState = false;
 unsigned long audioCandidateSince = 0;
+unsigned long lastStatusPrint = 0;
 
 // ------------------------------------------------------------------
 // LittleFS <-> AnimatedGIF file callbacks
@@ -187,6 +202,16 @@ void updateAudioReactiveGif() {
       gif.reset(); // loop the same gif again
     }
   } else {
+    // Print a status line once a second, forever, so whenever you connect
+    // the Serial Monitor you see the current state within ~1 second -
+    // no need to catch the exact moment of boot.
+    if (millis() - lastStatusPrint > 1000) {
+      lastStatusPrint = millis();
+      Serial.printf("[STATUS] LittleFS mounted: %s | gifOpenOk: %s | state: %s\n",
+                    littleFsMounted ? "yes" : "no",
+                    gifOpenOk ? "yes" : "no",
+                    audioIsTalking ? "talking" : "silence");
+    }
     delay(200);
     audioGifOpenForState(audioIsTalking);
   }
@@ -194,10 +219,14 @@ void updateAudioReactiveGif() {
 
 void setup() {
   Serial.begin(115200);
-for (int i = 5; i > 0; i--) {
+
+  for (int i = 5; i > 0; i--) {
     Serial.printf("Starting in %d...\n", i);
     delay(1000);
-}
+  }
+
+  dumpPartitionTable();
+
   /*-------------------- START THE HUB75E DISPLAY --------------------*/
   HUB75_I2S_CFG mxconfig(
     PANEL_RES_X,
@@ -213,18 +242,29 @@ for (int i = 5; i > 0; i--) {
   dma_display->setBrightness8(128); //0-255
   dma_display->clearScreen();
 
+  dma_display->fillScreenRGB888(255,0,0);
+  delay(500);
+  dma_display->fillScreenRGB888(0,255,0);
+  delay(500);
+  dma_display->fillScreenRGB888(0,0,255);
+  delay(500);
+  dma_display->clearScreen();
+
   /*-------------------- INIT LITTLE FS --------------------*/
-  if(!LittleFS.begin(FORMAT_LITTLEFS_IF_FAILED)){
-      Serial.println("LittleFS Mount Failed");
-      return;
+  littleFsMounted = LittleFS.begin(FORMAT_LITTLEFS_IF_FAILED);
+  if (!littleFsMounted) {
+      Serial.println("*** LittleFS Mount FAILED ***");
+  } else {
+      Serial.println("*** LittleFS Mount OK ***");
+      listDir(LittleFS, "/", 1);
   }
-  listDir(LittleFS, "/", 1);
 
   /*-------------------- Audio-reactive GIF init --------------------*/
   analogReadResolution(12);       // 0-4095
   analogSetAttenuation(ADC_11db); // full 0-3.3V range for the mic swing
   pinMode(MIC_PIN, INPUT);
   audioGifCalibrateNoiseFloor();  // stay quiet during boot for a clean baseline
+
   gif.begin(GIF_PALETTE_RGB565_BE);
   audioGifOpenForState(false);    // start on the silence gif
 }
