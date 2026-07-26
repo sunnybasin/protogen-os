@@ -205,12 +205,13 @@ void setup() {
     PANEL_CHAIN,
     _pins_x1
   );
-  mxconfig.i2sspeed = HUB75_I2S_CFG::HZ_20M;
+  mxconfig.i2sspeed = HUB75_I2S_CFG::HZ_10M; // lowered from HZ_20M to fix stray pixel flicker
   mxconfig.latch_blanking = 4;
+  mxconfig.driver = HUB75_I2S_CFG::FM6126A; // try this - fixes stray flicker on some P3 panel driver chips
 
   dma_display = new MatrixPanel_I2S_DMA(mxconfig);
   dma_display->begin();
-  dma_display->setBrightness8(64); //0-255 - lowered to cut current draw roughly in half
+  dma_display->setBrightness8(32); //0-255 - lowered further to ease load on the power supply
   dma_display->clearScreen();
 
   dma_display->fillScreenRGB888(255,0,0);
