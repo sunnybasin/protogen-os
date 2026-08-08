@@ -1,7 +1,29 @@
-// Minimal LED Matrix Firmware for the Huidu WF2 (ESP32-S3) HUB75 Control Card.
-// No WiFi, no RTC/NTP, no web server, no button. Just: boot -> play
-// audio-reactive GIF forever, switching between silence.gif and talking.gif
-// based on a MAX4466 mic on GPIO1.
+// LED Matrix Firmware for the Huidu WF2 (ESP32-S3) HUB75 Control Card.
+//
+// This file just wires everything together and holds setup()/loop() -
+// the actual logic lives in these files (all in src/ alongside this one):
+//   config.h          - board pins, WiFi/AP settings, timing constants
+//   gifs_data.h        - every embedded gif and the lists that reference them
+//   colors.h           - tint color palette and the rainbow color-wheel helper
+//   display_state.h    - shared runtime state (current gif/color/brightness/etc.)
+//   gif_playback.h      - gif drawing/tinting logic and the apply*() helpers
+//   web_interface.h     - the embedded control web page and its HTTP API
+//
+// Behavior summary:
+//   - Click the button: cycle tint color (white -> red -> green -> blue ->
+//     orange -> purple -> ... -> rainbow -> back to white)
+//   - Double-click quickly: reset to the GIF's normal, untinted colors
+//   - Hold the button (500ms+): cycle to the next GIF in gifList[]
+//   - Web page, via your home WiFi: visit the IP printed at boot, or
+//     http://protocontroller.local
+//   - Web page, via the board's own WiFi: connect to AP_SSID (see
+//     config.h) and visit http://192.168.4.1 - always works, home WiFi
+//     or not. Most phones will auto-prompt to open it (captive portal).
+//
+// On boot: initializing gif -> pairing/connecting gif -> startup gif
+// (in real colors) -> hands off to the normal button-controlled gifs.
+//
+// To add more GIFs, see the instructions at the top of gifs_data.h.
 
 #if defined(WF1)
   #include "hd-wf1-esp32s2-config.h"
@@ -14,187 +36,26 @@
 #include "debug.h"
 
 #include <Arduino.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <DNSServer.h>
+#include <ESPmDNS.h>
+#include <Preferences.h>
 #include <ESP32-HUB75-MatrixPanel-I2S-DMA.h>
 #include <AnimatedGIF.h>
+#include <Bounce2.h>
 #include "esp_partition.h"
 
-// Generate these two files with bin2h.py (see project notes), then place
-// them in src/ alongside this file:
-//   python bin2h.py silence.gif silence_gif silence_gif.h
-//   python bin2h.py talking.gif talking_gif talking_gif.h
-#include "silence_gif.h"
-#include "talking_gif.h"
-
-void dumpPartitionTable() {
-  Serial.println("---- Partition table on this chip ----");
-  esp_partition_iterator_t it = esp_partition_find(ESP_PARTITION_TYPE_ANY, ESP_PARTITION_SUBTYPE_ANY, NULL);
-  while (it != NULL) {
-    const esp_partition_t *p = esp_partition_get(it);
-    Serial.printf("  %-10s type=%d subtype=%d offset=0x%06x size=0x%06x (%u KB)\n",
-                  p->label, p->type, p->subtype, p->address, p->size, p->size / 1024);
-    it = esp_partition_next(it);
-  }
-  esp_partition_iterator_release(it);
-  Serial.println("---------------------------------------");
-}
-
-/*-------------------------- HUB75E DMA Setup -----------------------------*/
-#define PANEL_RES_X 64      // Number of pixels wide of each INDIVIDUAL panel module.
-#define PANEL_RES_Y 32      // Number of pixels tall of each INDIVIDUAL panel module.
-#define PANEL_CHAIN 2       // You have 2x 64x32 modules chained
-
-#if defined(WF1)
-HUB75_I2S_CFG::i2s_pins _pins_x1 = {WF1_R1_PIN, WF1_G1_PIN, WF1_B1_PIN, WF1_R2_PIN, WF1_G2_PIN, WF1_B2_PIN, WF1_A_PIN, WF1_B_PIN, WF1_C_PIN, WF1_D_PIN, WF1_E_PIN, WF1_LAT_PIN, WF1_OE_PIN, WF1_CLK_PIN};
-#else
-HUB75_I2S_CFG::i2s_pins _pins_x1 = {WF2_X1_R1_PIN, WF2_X1_G1_PIN, WF2_X1_B1_PIN, WF2_X1_R2_PIN, WF2_X1_G2_PIN, WF2_X1_B2_PIN, WF2_A_PIN, WF2_B_PIN, WF2_C_PIN, WF2_D_PIN, WF2_X1_E_PIN, WF2_LAT_PIN, WF2_OE_PIN, WF2_CLK_PIN};
-#endif
-
-// Mic input. GPIO1 is the only free ADC1 pin on the WF2 - everything else
-// (2-13) is claimed by the HUB75 bus. Wire MAX4466 OUT here, VCC->3V3, GND->GND.
-#define MIC_PIN 1
-#define AUDIOGIF_SAMPLE_WINDOW_MS 30
-#define AUDIOGIF_CALIBRATION_MS   2000
-#define AUDIOGIF_MARGIN_ON        60
-#define AUDIOGIF_MARGIN_OFF       25
-#define AUDIOGIF_STATE_DWELL_MS   400
-#define AUDIOGIF_EMA_ALPHA        0.35f
-
-MatrixPanel_I2S_DMA *dma_display = nullptr;
-
-AnimatedGIF gif;
-bool gifOpenOk = false;
-int audioNoiseFloor = 0;
-float audioSmoothedLevel = 0;
-bool audioIsTalking = false;
-bool audioCandidateState = false;
-unsigned long audioCandidateSince = 0;
-unsigned long lastStatusPrint = 0;
-
-// ------------------------------------------------------------------
-// GIF draw callback - called once per decoded scanline
-// ------------------------------------------------------------------
-void AudioGifDraw(GIFDRAW *pDraw) {
-  uint8_t *s = pDraw->pPixels;
-  uint16_t *usPalette = pDraw->pPalette;
-  int y = pDraw->iY + pDraw->y;
-  int iWidth = pDraw->iWidth;
-  int matrixWidth = PANEL_RES_X * PANEL_CHAIN;
-  if (iWidth > matrixWidth) iWidth = matrixWidth;
-
-  if (pDraw->ucDisposalMethod == 2) {
-    for (int x = 0; x < iWidth; x++) {
-      if (s[x] == pDraw->ucTransparent) s[x] = pDraw->ucBackground;
-    }
-    pDraw->ucHasTransparency = 0;
-  }
-
-  if (pDraw->ucHasTransparency) {
-    uint8_t ucTransparent = pDraw->ucTransparent;
-    for (int x = 0; x < iWidth; x++) {
-      uint8_t c = s[x];
-      if (c != ucTransparent) {
-        dma_display->drawPixel(x, y, usPalette[c]);
-      }
-    }
-  } else {
-    for (int x = 0; x < iWidth; x++) {
-      dma_display->drawPixel(x, y, usPalette[s[x]]);
-    }
-  }
-}
-
-// ------------------------------------------------------------------
-// Audio sampling + gif switching logic
-// ------------------------------------------------------------------
-int audioGifSamplePeakToPeak() {
-  unsigned long start = millis();
-  int minVal = 4095, maxVal = 0;
-  while (millis() - start < AUDIOGIF_SAMPLE_WINDOW_MS) {
-    int v = analogRead(MIC_PIN);
-    if (v < minVal) minVal = v;
-    if (v > maxVal) maxVal = v;
-  }
-  return maxVal - minVal;
-}
-
-void audioGifCalibrateNoiseFloor() {
-  Serial.println("Calibrating mic noise floor - stay quiet...");
-  long total = 0;
-  int samples = 0;
-  unsigned long start = millis();
-  while (millis() - start < AUDIOGIF_CALIBRATION_MS) {
-    total += audioGifSamplePeakToPeak();
-    samples++;
-  }
-  audioNoiseFloor = samples > 0 ? (total / samples) : 20;
-  audioSmoothedLevel = audioNoiseFloor;
-  Serial.printf("Noise floor: %d (from %d samples)\n", audioNoiseFloor, samples);
-}
-
-void audioGifOpenForState(bool talking) {
-  gif.close();
-  if (talking) {
-    gifOpenOk = gif.open((uint8_t *)talking_gif, talking_gif_len, AudioGifDraw);
-  } else {
-    gifOpenOk = gif.open((uint8_t *)silence_gif, silence_gif_len, AudioGifDraw);
-  }
-  if (!gifOpenOk) {
-    Serial.printf("Failed to open %s gif\n", talking ? "talking" : "silence");
-  } else {
-    Serial.printf("Playing %s gif\n", talking ? "talking" : "silence");
-  }
-}
-
-void audioGifUpdateState() {
-  int level = audioGifSamplePeakToPeak();
-  audioSmoothedLevel = audioSmoothedLevel * (1.0f - AUDIOGIF_EMA_ALPHA) + level * AUDIOGIF_EMA_ALPHA;
-
-  int onThresh = audioNoiseFloor + AUDIOGIF_MARGIN_ON;
-  int offThresh = audioNoiseFloor + AUDIOGIF_MARGIN_OFF;
-
-  bool rawTalking = audioIsTalking ? (audioSmoothedLevel > offThresh) : (audioSmoothedLevel > onThresh);
-
-  if (rawTalking != audioCandidateState) {
-    audioCandidateState = rawTalking;
-    audioCandidateSince = millis();
-  }
-
-  if (audioCandidateState != audioIsTalking && (millis() - audioCandidateSince) >= AUDIOGIF_STATE_DWELL_MS) {
-    audioIsTalking = audioCandidateState;
-    Serial.printf("State change -> %s (level=%.1f)\n", audioIsTalking ? "TALKING" : "SILENCE", audioSmoothedLevel);
-    audioGifOpenForState(audioIsTalking);
-  }
-}
-
-void updateAudioReactiveGif() {
-  audioGifUpdateState();
-
-  if (gifOpenOk) {
-    if (!gif.playFrame(true, NULL)) {
-      gif.reset(); // loop the same gif again
-    }
-  } else {
-    // Print a status line once a second, forever, so whenever you connect
-    // the Serial Monitor you see the current state within ~1 second -
-    // no need to catch the exact moment of boot.
-    if (millis() - lastStatusPrint > 1000) {
-      lastStatusPrint = millis();
-      Serial.printf("[STATUS] gifOpenOk: %s | state: %s\n",
-                    gifOpenOk ? "yes" : "no",
-                    audioIsTalking ? "talking" : "silence");
-    }
-    delay(200);
-    audioGifOpenForState(audioIsTalking);
-  }
-}
+#include "config.h"
+#include "gifs_data.h"
+#include "colors.h"
+#include "display_state.h"
+#include "gif_playback.h"
+#include "web_interface.h"
 
 void setup() {
   Serial.begin(115200);
-
-  for (int i = 5; i > 0; i--) {
-    Serial.printf("Starting in %d...\n", i);
-    delay(1000);
-  }
+  delay(300);
 
   dumpPartitionTable();
 
@@ -205,33 +66,126 @@ void setup() {
     PANEL_CHAIN,
     _pins_x1
   );
-  mxconfig.i2sspeed = HUB75_I2S_CFG::HZ_10M; // lowered from HZ_20M to fix stray pixel flicker
-  mxconfig.latch_blanking = 4;
-  mxconfig.driver = HUB75_I2S_CFG::FM6126A; // try this - fixes stray flicker on some P3 panel driver chips
+  mxconfig.i2sspeed = HUB75_I2S_CFG::HZ_10M;
+  mxconfig.latch_blanking = 8;
+  mxconfig.clkphase = false;
 
   dma_display = new MatrixPanel_I2S_DMA(mxconfig);
   dma_display->begin();
-  dma_display->setBrightness8(32); //0-255 - lowered further to ease load on the power supply
+  dma_display->setBrightness8((uint8_t)currentBrightness);
   dma_display->clearScreen();
 
-  dma_display->fillScreenRGB888(255,0,0);
-  delay(500);
-  dma_display->fillScreenRGB888(0,255,0);
-  delay(500);
-  dma_display->fillScreenRGB888(0,0,255);
-  delay(500);
-  dma_display->clearScreen();
+  /*-------------------- Button --------------------*/
+  button.attach(BUTTON_PIN, INPUT); // USE EXTERNAL PULL-UP
+  button.interval(5);
+  button.setPressedState(LOW);
 
-  /*-------------------- Audio-reactive GIF init --------------------*/
-  analogReadResolution(12);       // 0-4095
-  analogSetAttenuation(ADC_11db); // full 0-3.3V range for the mic swing
-  pinMode(MIC_PIN, INPUT);
-  audioGifCalibrateNoiseFloor();  // stay quiet during boot for a clean baseline
-
+  /*-------------------- Boot-sequence gifs --------------------*/
   gif.begin(GIF_PALETTE_RGB565_BE);
-  audioGifOpenForState(false);    // start on the silence gif
+  playBootGif(initGif, INIT_GIF_MAX_MS);
+  playBootGif(pairingGif, PAIRING_GIF_MAX_MS);
+
+  /*-------------------- WiFi (own AP + optional home network) + Web server --------------------*/
+  prefs.begin("ledmatrix", false);
+  String savedSsid = prefs.getString("ssid", "");
+  String savedPass = prefs.getString("pass", "");
+  String ssidToUse = savedSsid.length() > 0 ? savedSsid : String(default_wifi_ssid);
+  String passToUse = savedSsid.length() > 0 ? savedPass : String(default_wifi_pass);
+
+  WiFi.mode(WIFI_AP_STA); // own AP always on, AND try to join a home network too
+
+  WiFi.softAP(AP_SSID, AP_PASSWORD);
+  Serial.print("Own WiFi network '" AP_SSID "' started. Connect and visit http://");
+  Serial.println(WiFi.softAPIP());
+
+  // Captive portal: redirect every DNS lookup made by a device connected to
+  // our AP straight to our own IP. Combined with onNotFound() below serving
+  // the control page for literally any path, this makes most phones/laptops
+  // automatically pop up the control page (like the "Sign in to network"
+  // prompt you see joining public WiFi) right after connecting.
+  dnsServer.start(53, "*", WiFi.softAPIP());
+
+  bool wifiConfigured = ssidToUse.length() > 0 && ssidToUse != "YOUR_WIFI_NAME_HERE";
+  if (wifiConfigured) {
+    connectToWifi(ssidToUse, passToUse);
+  } else {
+    Serial.println("No home WiFi configured - relying on the board's own AP network only.");
+    Serial.println("(Set one any time from the web page's WiFi Settings section.)");
+  }
+
+  webServer.on("/", handleRoot);
+  webServer.on("/api/gifs", handleApiGifs);
+  webServer.on("/api/colors", handleApiColors);
+  webServer.on("/api/status", handleApiStatus);
+  webServer.on("/api/setGif", handleApiSetGif);
+  webServer.on("/api/setColor", handleApiSetColor);
+  webServer.on("/api/setNormal", handleApiSetNormal);
+  webServer.on("/api/setBrightness", handleApiSetBrightness);
+  webServer.on("/api/setPower", handleApiSetPower);
+  webServer.on("/api/setWifi", handleApiSetWifi);
+  webServer.onNotFound(handleRoot); // any unrecognized path (captive portal probes, typos, etc.) just shows the control page
+  webServer.begin();
+  Serial.println("Web server started.");
+
+  /*-------------------- Startup gif + normal gif playback --------------------*/
+  dma_display->clearScreen();
+  playBootGif(startupGif, STARTUP_GIF_MAX_MS);
+  openCurrentGif();
 }
 
 void loop() {
-  updateAudioReactiveGif();
+  dnsServer.processNextRequest(); // captive portal DNS redirect
+  webServer.handleClient(); // AP is always up, so always service requests
+
+  button.update();
+
+  if (button.pressed()) {
+    buttonPressStartTime = millis();
+    buttonHoldHandled = false;
+  }
+
+  if (button.isPressed() && !buttonHoldHandled) {
+    if (millis() - buttonPressStartTime >= BUTTON_HOLD_MS) {
+      currentGifIndex = (currentGifIndex + 1) % NUM_GIFS;
+      Serial.printf("Gif -> %d\n", currentGifIndex);
+      openCurrentGif();
+      buttonHoldHandled = true;
+    }
+  }
+
+  if (button.released() && !buttonHoldHandled) {
+    unsigned long now = millis();
+    bool isDoubleClick = lastClickReleaseTime != 0 &&
+                          (now - lastClickReleaseTime) < DOUBLE_CLICK_WINDOW_MS;
+
+    if (isDoubleClick) {
+      normalColorMode = true;
+      lastClickReleaseTime = 0;
+      Serial.println("Double-click -> normal colors");
+    } else {
+      normalColorMode = false;
+      currentTintIndex = (currentTintIndex + 1) % NUM_TINT_MODES;
+      lastClickReleaseTime = now;
+      Serial.printf("Color mode -> %d\n", currentTintIndex);
+    }
+  }
+
+  if (displayPoweredOn) {
+    if (gifOpenOk) {
+      if (millis() >= nextFrameTime) {
+        int delayMs = 0;
+        if (!gif.playFrame(false, &delayMs)) {
+          gif.reset();
+          delayMs = 0;
+        }
+        if (delayMs < 0 || delayMs > MAX_FRAME_DELAY_MS) {
+          delayMs = MAX_FRAME_DELAY_MS;
+        }
+        nextFrameTime = millis() + delayMs;
+      }
+    } else {
+      delay(200);
+      openCurrentGif();
+    }
+  }
 }
