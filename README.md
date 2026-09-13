@@ -25,7 +25,26 @@ The web interface automatically pops up when connected to Wi-Fi (http://192.168.
 AP: PROTO CONTROLLER
 APPassword: protogen1234
 
+![PROTOGEN OS Lite](Screenshot%202026-09-13%20110016.png)
+
+## So many colors to choose from!
+
+![PROTOGEN OS Lite](Screenshot%202026-09-13%20110036.png)
+
+You can change the tint of the display to make it the color you want!
+
+
 You can connect the controller to the Wi-Fi you're currently on aswell!
 Wandering around? Don't worry! The controller emits an AP connection while being connected to the local Wi-Fi, so you can connect to another Wi-Fi service!
 
+-------------
 
+# Requirements
+
+- Platformio
+- Basic knowledge on coding
+
+-------------
+
+### built off of mrcodetastic's WF2 DMA
+(https://github.com/mrcodetastic/HD-WF1-WF2-LED-MatrixPanel-DMA)
