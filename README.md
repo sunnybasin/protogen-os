@@ -8,9 +8,24 @@ This is the lite version so it will work on WF2 controllers. Full version will c
 
 Uses HUB75 Panels
 
----
+-------
 
 # Features
 
 - Web interface
 - Wireless connectivity and WiFi
+- Changeable display color filters
+- Rainbow!
+
+-------------
+
+# Web Interface
+
+The web interface automatically pops up when connected to Wi-Fi (http://192.168.4.1)
+AP: PROTO CONTROLLER
+APPassword: protogen1234
+
+You can connect the controller to the Wi-Fi you're currently on aswell!
+Wandering around? Don't worry! The controller emits an AP connection while being connected to the local Wi-Fi, so you can connect to another Wi-Fi service!
+
+
