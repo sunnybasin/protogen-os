@@ -40,4 +40,5 @@ Wandering around? Don't worry! The controller emits an AP connection while being
 -------------
 
 Built off of mrcodetastic's WF2 DMA
+
 (https://github.com/mrcodetastic/HD-WF1-WF2-LED-MatrixPanel-DMA)
