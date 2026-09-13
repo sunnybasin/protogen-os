@@ -1,6 +1,6 @@
 # PROTOGEN OS (LITE VER) SOFTWARE
 
-![PROTOGEN OS Lite](IMG_2942%20-%20Copy%20(1).png)
+![PROTOGEN OS Lite](image%20(1).png)
 
 Custom software for your WF2 or ESP32-S3 based controller!
 
